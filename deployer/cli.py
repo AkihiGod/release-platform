@@ -90,6 +90,14 @@ def container_running(name):
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
+def parse_version_from_env(text):
+    """从 docker inspect 出来的那几行环境变量里挑 APP_VERSION。"""
+    for line in text.splitlines():
+        if line.startswith("APP_VERSION="):
+            return line.split("=", 1)[1]
+    return None
+
+
 def container_version(name):
     """从容器的环境变量里读版本号。
 
@@ -98,10 +106,7 @@ def container_version(name):
     result = docker(["inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", name])
     if result.returncode != 0:
         return None
-    for line in result.stdout.splitlines():
-        if line.startswith("APP_VERSION="):
-            return line.split("=", 1)[1]
-    return None
+    return parse_version_from_env(result.stdout)
 
 
 def lookup_container(target):
@@ -136,6 +141,15 @@ def build_image(version):
     return tag
 
 
+def parse_published_ports(text):
+    """从 docker ps 的 Ports 列里抠出宿主端口。形如 0.0.0.0:8000->5000/tcp。"""
+    ports = set()
+    for line in text.splitlines():
+        for m in re.finditer(r":(\d+)->", line):
+            ports.add(int(m.group(1)))
+    return ports
+
+
 def used_host_ports():
     """问 docker 要已经被容器占掉的宿主端口。
 
@@ -143,11 +157,7 @@ def used_host_ports():
     127.0.0.1:8000 居然还能成功（Linux 会报占用），拿这个结果当空闲就会撞车。
     """
     result = docker(["ps", "--format", "{{.Ports}}"])
-    ports = set()
-    for line in result.stdout.splitlines():
-        for m in re.finditer(r":(\d+)->", line):
-            ports.add(int(m.group(1)))
-    return ports
+    return parse_published_ports(result.stdout)
 
 
 def pick_free_host_port():
@@ -291,6 +301,28 @@ def rollback_to(target):
     return False
 
 
+def should_skip_deploy(target, version, is_running):
+    """当前收流量的就已经是目标版本 -> 这次发布无事可做。
+
+    拆成纯函数是为了能脱机单测：is_running 传进来，而不是在里面问 docker。
+    """
+    return target == container_name(version) and is_running
+
+
+def pick_rollback_version(rows, current, is_running):
+    """从发布历史里挑手动回滚的目标。
+
+    规则：跳过当前版本，取最近一个容器还在跑的。is_running 用回调传进来，
+    这样这段挑版本的逻辑不用连 docker 也能测。
+    """
+    for row in rows:
+        if row["version"] == current:
+            continue
+        if is_running(container_name(row["version"])):
+            return row["version"]
+    return None
+
+
 def record(app, version, status, note, started_at):
     store.record(app, version, git_sha(), status, operator(), started_at, now(), note)
 
@@ -306,7 +338,7 @@ def cmd_deploy(app, version, env_vars):
 
     # 幂等：目标版本就是当前在收流量的那个，直接返回，不重建不重启
     target = read_active_target()
-    if target == container_name(version) and container_running(target):
+    if should_skip_deploy(target, version, container_running(target)):
         print(f"{version} 已经在跑了，跳过")
         return 0
 
@@ -420,21 +452,16 @@ def cmd_rollback(app):
     print(f"当前入口：{target}（{current}）")
 
     # 从发布历史往前找：跳过当前版本，挑第一个容器还活着的
-    for row in store.history(app, limit=50):
-        if row["version"] == current:
-            continue
-        name = container_name(row["version"])
-        if not container_running(name):
-            continue
-        print(f"回滚到 {row['version']}")
-        if not rollback_to(name):
-            print("回滚失败")
-            return 1
-        record(app, row["version"], "rollback", f"手动从 {current} 回滚", now())
-        return 0
-
-    print("没有可回滚的版本：历史里找不到容器还在跑的上一版")
-    return 1
+    version = pick_rollback_version(store.history(app, limit=50), current, container_running)
+    if not version:
+        print("没有可回滚的版本：历史里找不到容器还在跑的上一版")
+        return 1
+    print(f"回滚到 {version}")
+    if not rollback_to(container_name(version)):
+        print("回滚失败")
+        return 1
+    record(app, version, "rollback", f"手动从 {current} 回滚", now())
+    return 0
 
 
 def main():
