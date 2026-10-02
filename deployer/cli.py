@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-发布工具（第3轮）：构建镜像 → 起新版本 → 健康检查 → 切流量 → 观察，不对就自动回滚。
-发布历史落库在第4轮。
+发布工具：一条命令完成 构建镜像 → 起新版本 → 健康检查 → 切流量 → 观察，不对就自动回滚，
+每次发布都落一条历史。
 
-用法：python deployer/cli.py deploy app v1.1.0
+用法：
+  python deployer/cli.py deploy app v1.1.0
+  python deployer/cli.py status app
+  python deployer/cli.py history app
+  python deployer/cli.py rollback app
 """
 import argparse
 import json
+import os
 import re
 import socket
 import subprocess
@@ -14,7 +19,10 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
+
+import store
 
 # 路径按脚本位置算，这样在哪个目录下敲命令都能跑
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -39,6 +47,77 @@ def docker(args, capture=True):
 def opener():
     # 这台机器设了系统代理，urllib 默认连 localhost 都往代理塞，全部请求都要绕开它
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def git_sha():
+    """当前提交。取不到就算了，别让发布因为环境里没 git 就整个挂掉。"""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def operator():
+    """谁发的。优先用 git 配的名字，退回系统用户名。"""
+    try:
+        result = subprocess.run(
+            ["git", "config", "user.name"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return os.environ.get("USERNAME") or os.environ.get("USER") or "unknown"
+
+
+def container_name(version):
+    return f"{IMAGE_NAME}-{version}"
+
+
+def container_running(name):
+    result = docker(["inspect", "-f", "{{.State.Running}}", name])
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def container_version(name):
+    """从容器的环境变量里读版本号。
+
+    比按容器名去猜可靠：基线那个容器叫 app，名字里根本没有版本信息。
+    """
+    result = docker(["inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", name])
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("APP_VERSION="):
+            return line.split("=", 1)[1]
+    return None
+
+
+def lookup_container(target):
+    """把 upstream 里的名字解析成真实容器名。
+
+    部署过的版本，upstream 里写的就是容器名，能直接 inspect。但基线是 compose
+    的服务名 app，docker 里根本没有叫 app 的容器（真名叫 release-platform-app-1），
+    直接按名字去查会说"没在跑"，其实一直在跑。
+    """
+    if container_running(target):
+        return target
+    result = docker(["ps", "--format", "{{.Names}}"])
+    for line in result.stdout.splitlines():
+        if line.endswith(f"-{target}-1"):
+            return line
+    return None
 
 
 def ensure_network():
@@ -87,14 +166,15 @@ def pick_free_host_port():
 
 
 def start_container(version, host_port, env_vars):
-    name = f"{IMAGE_NAME}-{version}"
-    # 同名容器先清掉，重复执行别炸。真正的幂等（看发布历史直接返回）在第4轮
+    name = container_name(version)
     docker(["rm", "-f", name])
     args = [
         "run", "-d",
         "--name", name,
         "--network", NETWORK,
         "-e", f"APP_VERSION={version}",
+        # 把提交号也注进去，线上哪个版本对应哪次提交能直接查
+        "-e", f"GIT_SHA={git_sha()}",
     ]
     for kv in env_vars:
         args += ["-e", kv]
@@ -132,7 +212,7 @@ def health_check(host_port, timeout=30, interval=1.0):
 
 
 def read_active_target():
-    """读出当前 upstream 指向谁，回滚要用。"""
+    """读出当前 upstream 指向谁。"""
     m = re.search(r"server\s+([\w.-]+):\d+;", UPSTREAM_FILE.read_text(encoding="utf-8"))
     return m.group(1) if m else None
 
@@ -211,18 +291,30 @@ def rollback_to(target):
     return False
 
 
+def record(app, version, status, note, started_at):
+    store.record(app, version, git_sha(), status, operator(), started_at, now(), note)
+
+
 def cmd_deploy(app, version, env_vars):
     started = time.time()
+    started_at = now()
     print(f"发布 {app} {version}")
 
     if not ensure_network():
         print(f"找不到网络 {NETWORK}，先在项目根目录跑 docker compose up -d")
         return 1
 
+    # 幂等：目标版本就是当前在收流量的那个，直接返回，不重建不重启
+    target = read_active_target()
+    if target == container_name(version) and container_running(target):
+        print(f"{version} 已经在跑了，跳过")
+        return 0
+
     print("[1/5] 构建镜像 ...", end=" ", flush=True)
     t = time.time()
     if not build_image(version):
         print("失败")
+        record(app, version, "failed", "镜像构建失败", started_at)
         return 1
     print(f"ok ({time.time() - t:.1f}s)")
 
@@ -230,10 +322,12 @@ def cmd_deploy(app, version, env_vars):
     host_port = pick_free_host_port()
     if host_port is None:
         print("失败：8000-8099 都被占了")
+        record(app, version, "failed", "没有空闲端口可分配", started_at)
         return 1
     name = start_container(version, host_port, env_vars)
     if not name:
         print("失败")
+        record(app, version, "failed", "容器启动失败", started_at)
         return 1
     print(f"ok（{name} 挂到宿主 {host_port}）")
 
@@ -242,8 +336,9 @@ def cmd_deploy(app, version, env_vars):
     if not ok:
         # 这时候流量还没切，线上一点感觉都没有，直接清掉新容器就行
         print(f"失败（探测 {attempts} 次都没过）")
-        print(f"  新版本没起来，没有切流量，线上不受影响")
+        print("  新版本没起来，没有切流量，线上不受影响")
         docker(["rm", "-f", name])
+        record(app, version, "failed", f"健康检查 {attempts} 次未通过，未切流量", started_at)
         return 1
     print(f"ok（探测 {attempts} 次通过）")
 
@@ -256,17 +351,22 @@ def cmd_deploy(app, version, env_vars):
         if previous:
             rollback_to(previous)
         docker(["rm", "-f", name])
+        record(app, version, "failed", "切流量未生效，已恢复原状", started_at)
         return 1
     print("ok（入口已指向新版本）")
 
     print(f"[5/5] 观察期 {OBSERVE_SECONDS}s ...", end=" ", flush=True)
     if not observe_health(OBSERVE_SECONDS):
         print("失败：观察期内入口开始报错")
-        if previous and rollback_to(previous):
+        rolled = previous and rollback_to(previous)
+        if rolled:
             print(f"  已自动回滚，线上仍是 {previous}")
         else:
             print("  回滚失败，需要人工介入")
         docker(["rm", "-f", name])
+        record(app, version, "rolled_back",
+               f"观察期内报错，已回滚到 {previous}" if rolled else "观察期内报错，回滚失败",
+               started_at)
         return 1
     print("ok")
 
@@ -274,10 +374,72 @@ def cmd_deploy(app, version, env_vars):
     if previous:
         # 旧版本先留着不删：万一事后再出问题，切回去只是一次 reload，不用重建
         print(f"  旧版本 {previous} 仍保持运行，用于随时回滚")
+    record(app, version, "success", f"由 {previous} 切到 {version}" if previous else "首次发布",
+           started_at)
     return 0
 
 
+def cmd_status(app):
+    target = read_active_target()
+    if not target:
+        print("读不出当前版本，检查 proxy/upstream.d/active.conf")
+        return 1
+
+    name = lookup_container(target)
+    version = container_version(name) if name else None
+    print(f"入口 {ENTRY_URL} 指向 {target}" + (f"（{version}）" if version else ""))
+    print("容器状态：" + ("运行中" if name else "没在跑"))
+
+    rows = store.history(app, limit=1)
+    if rows:
+        r = rows[0]
+        print(f"最近一次发布：{r['version']} {store.STATUS_TEXT.get(r['status'], r['status'])}"
+              f"  {r['finished_at']}  by {r['operator']}")
+    else:
+        print("还没有发布记录")
+    return 0
+
+
+def cmd_history(app, limit):
+    rows = store.history(app, limit)
+    if not rows:
+        print("还没有发布记录")
+        return 0
+    print(f"{'版本':<9}{'状态':<7}{'操作人':<11}{'时间':<21}{'git':<9}备注")
+    for r in rows:
+        print(f"{r['version']:<9}{store.STATUS_TEXT.get(r['status'], r['status']):<6}"
+              f"{(r['operator'] or ''):<10}{r['finished_at'] or '':<20}"
+              f"{(r['git_sha'] or ''):<8}{r['note'] or ''}")
+    return 0
+
+
+def cmd_rollback(app):
+    target = read_active_target()
+    active_name = lookup_container(target) if target else None
+    current = container_version(active_name) if active_name else None
+    print(f"当前入口：{target}（{current}）")
+
+    # 从发布历史往前找：跳过当前版本，挑第一个容器还活着的
+    for row in store.history(app, limit=50):
+        if row["version"] == current:
+            continue
+        name = container_name(row["version"])
+        if not container_running(name):
+            continue
+        print(f"回滚到 {row['version']}")
+        if not rollback_to(name):
+            print("回滚失败")
+            return 1
+        record(app, row["version"], "rollback", f"手动从 {current} 回滚", now())
+        return 0
+
+    print("没有可回滚的版本：历史里找不到容器还在跑的上一版")
+    return 1
+
+
 def main():
+    store.init_db()
+
     parser = argparse.ArgumentParser(description="发布与回滚平台")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -289,13 +451,30 @@ def main():
         help="给容器注入环境变量，可重复。也用来注入故障开关做演练",
     )
 
+    p = sub.add_parser("status", help="当前收流量的是哪个版本")
+    p.add_argument("app")
+
+    p = sub.add_parser("history", help="发布历史")
+    p.add_argument("app")
+    p.add_argument("--limit", type=int, default=10)
+
+    p = sub.add_parser("rollback", help="回滚到上一版")
+    p.add_argument("app")
+
     args = parser.parse_args()
+
     if args.command == "deploy":
         for kv in args.env_vars:
             if "=" not in kv:
                 print(f"--env 要写成 K=V 的形式，收到的是 {kv}")
                 return 2
         return cmd_deploy(args.app, args.version, args.env_vars)
+    if args.command == "status":
+        return cmd_status(args.app)
+    if args.command == "history":
+        return cmd_history(args.app, args.limit)
+    if args.command == "rollback":
+        return cmd_rollback(args.app)
     return 1
 
 
